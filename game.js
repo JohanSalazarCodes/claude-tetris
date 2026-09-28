@@ -45,6 +45,12 @@ const POWERUP_FREEZE_MS = 5000;
 // (con al menos 1 bloque y al menos 2 huecos) también aparece un powerup.
 const POWERUP_CLUTTER_ROWS = 11;
 const POWERUP_CLUTTER_MIN_GAPS = 2;
+// Piezas normales que deben caer entre dos powerups disparados por desorden.
+// Sin este enfriamiento, mientras el tablero siguiera "sucio" el disparador se
+// reevaluaba en cada lockPiece() y volvía a armarse de inmediato en el spawn()
+// siguiente, generando una cadena casi ininterrumpida de powerups de rescate
+// que impedía perder la partida.
+const POWERUP_CLUTTER_COOLDOWN = 15;
 
 const POWERUPS = [
   {
@@ -61,7 +67,7 @@ const POWERUPS = [
     name: 'Rayo',
     color: '#fff176',
     icon: '⚡',
-    desc: 'Al aterrizar, limpia por completo la fila o la columna donde cae (al azar).',
+    desc: 'Al aterrizar, limpia por completo la fila donde cae, o un tramo de la columna a su alrededor (al azar).',
   },
   {
     id: 'tint',
@@ -176,13 +182,21 @@ const powerupLegendEl = document.getElementById('powerup-legend');
 const pauseMenu = document.getElementById('pause-menu');
 const resumeBtn = document.getElementById('resume-btn');
 const pauseRestartBtn = document.getElementById('pause-restart-btn');
-const toggleControlsBtn = document.getElementById('toggle-controls-btn');
-const pauseControlsList = document.getElementById('pause-controls-list');
 const startLevelSelect = document.getElementById('start-level-select');
+const leaderboardListEl = document.getElementById('leaderboard-list');
+const resetLeaderboardBtn = document.getElementById('reset-leaderboard-btn');
+const overlayRecordEl = document.getElementById('overlay-record');
+const overlaySaveEl = document.getElementById('overlay-save');
+const playerNameInput = document.getElementById('player-name-input');
+const saveScoreBtn = document.getElementById('save-score-btn');
+const overlaySavedMsg = document.getElementById('overlay-saved-msg');
+
+const LEADERBOARD_KEY = 'tetris-leaderboard';
+const LEADERBOARD_MAX = 5;
 
 
 let board, current, next, score, lines, level, paused, gameOver, lastTime, dropAccum, dropInterval, animId, theme;
-let powerupCounter, pendingPowerup, freezeUntil, powerupBannerTimeout;
+let powerupCounter, pendingPowerup, freezeUntil, powerupBannerTimeout, clutterCooldown;
 let bestCombo;
 // Se inicializa de forma síncrona (no solo vía initSkin()) para que la primera
 // pieza dibujada por init() ya use la skin persistida, sin depender del orden
@@ -323,6 +337,12 @@ function explodeArea(cx, cy) {
       if (r >= 0 && r < ROWS && c >= 0 && c < COLS) board[r][c] = 0;
 }
 
+// Alcance vertical del modo columna: una franja local alrededor de donde cae
+// la pieza, igual que Bomba usa un área local en vez de todo el tablero.
+// Así no puede despejar la fila 0 (zona de game over) salvo que la pieza
+// realmente haya caído hasta ahí.
+const POWERUP_COLUMN_STRIKE_REACH = 3;
+
 function strikeLine(piece) {
   const mode = Math.random() < 0.5 ? 'row' : 'col';
   if (mode === 'row') {
@@ -331,7 +351,10 @@ function strikeLine(piece) {
     registerClearedLines(1, (LINE_SCORES[1] || 0) * level);
   } else {
     const col = Math.min(COLS - 1, piece.x + Math.floor(piece.shape[0].length / 2));
-    for (let r = 0; r < ROWS; r++) board[r][col] = 0;
+    const centerRow = piece.y + Math.floor(piece.shape.length / 2);
+    const top = Math.max(0, centerRow - POWERUP_COLUMN_STRIKE_REACH);
+    const bottom = Math.min(ROWS - 1, centerRow + POWERUP_COLUMN_STRIKE_REACH);
+    for (let r = top; r <= bottom; r++) board[r][col] = 0;
     score += 100 * level;
     updateHUD();
   }
@@ -430,8 +453,13 @@ function countClutteredRows() {
 }
 
 function maybeQueuePowerupFromClutter() {
+  if (clutterCooldown > 0) {
+    clutterCooldown--;
+    return;
+  }
   if (!pendingPowerup && countClutteredRows() >= POWERUP_CLUTTER_ROWS) {
     pendingPowerup = true;
+    clutterCooldown = POWERUP_CLUTTER_COOLDOWN;
   }
 }
 
@@ -681,6 +709,7 @@ function init(startLevel) {
   powerupCounter = 0;
   pendingPowerup = false;
   freezeUntil = 0;
+  clutterCooldown = 0;
   clearTimeout(powerupBannerTimeout);
   powerupBanner.classList.remove('show');
   powerupBanner.classList.add('hidden');
@@ -708,9 +737,16 @@ function renderPowerupLegend() {
   `).join('');
 }
 
+// Estas teclas las maneja el juego por completo; si no se bloquea su
+// comportamiento por defecto, el navegador también las aplica al elemento
+// con foco (p. ej. las flechas mueven la selección de un <select> nativo
+// como #skin-select, cambiando el skin al mover la pieza).
+const GAME_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp', 'KeyX', 'Space']);
+
 document.addEventListener('keydown', e => {
   if (e.code === 'KeyP' || e.code === 'Escape') { togglePause(); return; }
   if (paused || gameOver) return;
+  if (GAME_KEYS.has(e.code)) e.preventDefault();
   switch (e.code) {
     case 'ArrowLeft':
       if (!collide(current.shape, current.x - 1, current.y)) current.x--;
@@ -726,7 +762,6 @@ document.addEventListener('keydown', e => {
       tryRotate();
       break;
     case 'Space':
-      e.preventDefault();
       hardDrop();
       break;
   }
@@ -737,16 +772,18 @@ restartBtn.addEventListener('click', init);
 themeToggle.addEventListener('change', () => applyTheme(themeToggle.checked ? 'light' : 'dark'));
 saveScoreBtn.addEventListener('click', saveScoreToLeaderboard);
 resetLeaderboardBtn.addEventListener('click', resetLeaderboard);
-if (skinSelect) skinSelect.addEventListener('change', () => applySkin(skinSelect.value));
+if (skinSelect) skinSelect.addEventListener('change', () => {
+  applySkin(skinSelect.value);
+  // Evita que el <select> conserve el foco del teclado: con foco ahí, las
+  // flechas del juego también le llegarían al control nativo y cambiarían
+  // el skin en vez de (o además de) mover la pieza.
+  skinSelect.blur();
+});
 resumeBtn.addEventListener('click', togglePause);
 pauseRestartBtn.addEventListener('click', () => {
   pauseMenu.classList.add('hidden');
   const lvl = parseInt(startLevelSelect.value, 10) || 1;
   init(lvl);
-});
-toggleControlsBtn.addEventListener('click', () => {
-  const nowHidden = pauseControlsList.classList.toggle('hidden');
-  toggleControlsBtn.setAttribute('aria-expanded', String(!nowHidden));
 });
 startLevelSelect.addEventListener('change', () => {
   localStorage.setItem('tetris-start-level', startLevelSelect.value);
